@@ -98,6 +98,7 @@ def load_css() -> str:
 
 # ==================================================================== 2. STATE
 ss = st.session_state
+ss.setdefault("mic_n", 0)
 ss.setdefault("mode", "idle")          # idle | call | chat
 ss.setdefault("lang", agent.DEFAULT_LANGUAGE)
 ss.setdefault("messages", [])          # [{"role": "user"|"assistant"|"note", "content": ..., "ts": ...}]
@@ -399,6 +400,33 @@ def run_call() -> None:
     if ss.mode != "call":
         st.rerun()
 
+def run_browser_call() -> None:
+    """Call mode for servers: the browser records and plays the audio."""
+    if ss.say:                                    # the agent's turn: show text + play voice
+        text, ss.say = ss.say, None
+        add_message("assistant", text)
+        draw_history()
+        st.audio(agent.tts_bytes(text, ss.lang), format="audio/mp3", autoplay=True)
+        if ss.hangup:
+            finish("Call ended")
+            st.rerun()
+            return
 
+    rec = st.audio_input("Tap the mic, speak, then tap stop to send",
+                         key=f"mic_{ss.mic_n}")
+    if rec is not None:                           # the caller's turn
+        ss.mic_n += 1                             # resets the recorder for the next turn
+        with st.spinner("Thinking..."):
+            heard = agent.transcribe_audio(rec.getvalue(), ss.lang)
+            if heard:
+                add_message("user", heard)
+            saved_before = agent.count_saved_requests()
+            ss.say, ss.hangup = ss.agent.hear(heard)
+        toast_if_saved(saved_before)
+        st.rerun()
+        
 if mode == "call":
-    run_call()
+    if agent.LOCAL_AUDIO:
+        run_call()            # your PC: real microphone and speaker
+    else:
+        run_browser_call()

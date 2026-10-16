@@ -45,6 +45,10 @@ KB_FILE = os.path.join(BASE_DIR, "knowledge_base.md")
 
 if API_KEY:
     print(f"Using model {MODEL}")
+    
+    
+LOCAL_AUDIO = (all(importlib.util.find_spec(m) for m in ("pyaudio", "pygame", "gtts", "speech_recognition"))
+               and not os.getenv("BROWSER_AUDIO"))
 
 # Listening / timing
 SILENCE_WAIT_SECONDS = 15    # how long the agent waits for the caller to start speaking
@@ -61,6 +65,8 @@ BREVITY_NOTE = (
     "sentences and under 30 words. Give only the single most useful point and, if needed, ask ONE short "
     "question. Never give long explanations, lists, or several steps at once: give one step, then wait. "
     "Do not repeat the caller's question back.")
+
+
 
 # Loudness of an audio buffer (audioop is missing in newer Python versions)
 try:
@@ -734,15 +740,6 @@ def main() -> None:
 
     if not API_KEY:
         raise SystemExit("Set GEMINI_API_KEY in your .env file first.")
-    
-    
-    
-
-    # True on your Windows PC (mic + speaker on the same machine).
-    # False on Render/Linux, where the browser must do the audio.
-    # Set BROWSER_AUDIO=1 to force browser mode for testing on your PC.
-    LOCAL_AUDIO = (all(importlib.util.find_spec(m) for m in ("pyaudio", "pygame", "gtts", "speech_recognition"))
-                and not os.getenv("BROWSER_AUDIO"))
 
     agent = SupportAgent()
     _say(agent.greeting, voice_mode, agent.language)
