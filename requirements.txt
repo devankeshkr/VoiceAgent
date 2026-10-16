@@ -1,0 +1,10 @@
+streamlit
+pandas
+google-genai
+SpeechRecognition
+gTTS
+pyttsx3
+PyAudio
+requests
+python-dotenv
+faster-whisper

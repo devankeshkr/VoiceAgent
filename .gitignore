@@ -1,0 +1,14 @@
+# secrets
+.env
+
+# virtual environment
+agvenv/
+venv/
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# runtime data
+requests_log.csv
