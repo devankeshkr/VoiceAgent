@@ -21,10 +21,7 @@ import time
 import streamlit as st
 
 import agent  # backend: SupportAgent, speak_prepare, listen_live, ...
-import sys, asyncio
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
+   
 st.set_page_config(page_title="Ankesh Software Solutions | Support",
                    page_icon="🎧", layout="centered")
 

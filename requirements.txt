@@ -1,10 +1,8 @@
 streamlit
-pandas
 google-genai
+python-dotenv
+requests
 SpeechRecognition
 gTTS
-pyttsx3
-PyAudio
-requests
-python-dotenv
-faster-whisper
+PyAudio; platform_system == "Windows"
+pygame; platform_system == "Windows"

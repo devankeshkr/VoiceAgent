@@ -10,6 +10,11 @@ File map (top to bottom):
   7. Listening         - microphone + Google speech recognition
   8. Terminal version  - python agent.py [--text]
 """
+
+import asyncio
+import sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import argparse
 import csv
 import datetime
@@ -22,7 +27,7 @@ import sys
 import threading
 import time
 from collections import deque
-
+import importlib.util
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -461,6 +466,25 @@ def speak_local(text: str, language: str = DEFAULT_LANGUAGE) -> None:
     """Speak and wait until finished."""
     speak_finish(speak_start(text, language))
 
+def tts_bytes(text: str, language: str = DEFAULT_LANGUAGE) -> bytes:
+    """Reply text -> MP3 bytes for the browser to play (works on any OS, no pygame)."""
+    from gtts import gTTS
+    code = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])["tts"]
+    buf = io.BytesIO()
+    gTTS(text=_speech_text(text, language), lang=code).write_to_fp(buf)
+    return buf.getvalue()
+
+
+def transcribe_audio(wav_bytes: bytes, language: str = DEFAULT_LANGUAGE) -> str:
+    """WAV recorded in the browser -> text (no PyAudio). Returns "" if not understood."""
+    import speech_recognition as sr
+    rec = sr.Recognizer()
+    try:
+        with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
+            audio = rec.record(source)
+        return rec.recognize_google(audio, language=LANGUAGES[language]["stt"])
+    except (sr.UnknownValueError, sr.RequestError, ValueError):
+        return ""
 
 # ================================================================ 7. LISTENING
 def _open_microphone(sr):
@@ -710,6 +734,15 @@ def main() -> None:
 
     if not API_KEY:
         raise SystemExit("Set GEMINI_API_KEY in your .env file first.")
+    
+    
+    
+
+    # True on your Windows PC (mic + speaker on the same machine).
+    # False on Render/Linux, where the browser must do the audio.
+    # Set BROWSER_AUDIO=1 to force browser mode for testing on your PC.
+    LOCAL_AUDIO = (all(importlib.util.find_spec(m) for m in ("pyaudio", "pygame", "gtts", "speech_recognition"))
+                and not os.getenv("BROWSER_AUDIO"))
 
     agent = SupportAgent()
     _say(agent.greeting, voice_mode, agent.language)
