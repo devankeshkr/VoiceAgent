@@ -1,33 +1,32 @@
-"""Backend for the CCMS voice/chat support agent. The UI (app.py) only calls this file.
+"""Backend brain of the CCMS support agent. It is UI-agnostic and has NO microphone / speaker code.
+
+The browser does the audio (speech-to-text and text-to-speech). This file only receives TEXT and
+returns TEXT, streamed sentence by sentence. Chat and Call use exactly the same methods:
+
+    agent = SupportAgent("Hindi")
+    for kind, value in agent.hear_stream("caller words"):   # streaming (used by the web server)
+        ...   # ("sentence", "one sentence") ... then ("end", {"ended": bool, "saved": bool})
+    reply, ended = agent.hear("caller words")                # same thing, but waits for the whole reply
 
 File map (top to bottom):
-  1. Settings          - .env values, file paths, timing constants
+  1. Settings          - .env values, file paths, logging
   2. Languages         - texts for every language
   3. System prompt     - instructions given to Gemini
   4. Tool              - save_appointment_request (Gemini calls it)
-  5. SupportAgent      - one conversation
-  6. Speaking          - text-to-speech (Google gTTS + pygame in a separate process)
-  7. Listening         - microphone + Google speech recognition
-  8. Terminal version  - python agent.py [--text]
-"""
+  5. SupportAgent      - one conversation (streaming)
+  6. Speech helpers    - text prepared for the browser voice, language list for the browser
+  7. Terminal version  - python agent.py   (text only)
 
-import asyncio
-import sys
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+Debugging tip: set LOG_LEVEL=DEBUG in .env to see every step in the console.
+"""
 import argparse
 import csv
 import datetime
-import io
-import json
+import logging
 import os
 import re
-import subprocess
-import sys
 import threading
-import time
-from collections import deque
-import importlib.util
+
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -37,26 +36,23 @@ from google.genai import types
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("ccms")
+
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 SHEET_URL = os.getenv("SHEET_WEBHOOK_URL", "")
-CSV_FILE = os.path.join(BASE_DIR, "requests_log.csv")
+# On cloud hosts the disk is wiped on restart: point DATA_DIR at a persistent volume if you keep the CSV.
+DATA_DIR = os.getenv("DATA_DIR", BASE_DIR)
+CSV_FILE = os.path.join(DATA_DIR, "requests_log.csv")
 KB_FILE = os.path.join(BASE_DIR, "knowledge_base.md")
 
-if API_KEY:
-    print(f"Using model {MODEL}")
-    
-    
-LOCAL_AUDIO = (all(importlib.util.find_spec(m) for m in ("pyaudio", "pygame", "gtts", "speech_recognition"))
-               and not os.getenv("BROWSER_AUDIO"))
+# A reply is spoken, so it must stay short. Extra sentences beyond this are not sent to the caller.
+MAX_REPLY_SENTENCES = int(os.getenv("MAX_REPLY_SENTENCES", "3"))
 
-# Listening / timing
-SILENCE_WAIT_SECONDS = 15    # how long the agent waits for the caller to start speaking
-END_OF_SPEECH_SECONDS = 1.3  # silence after speech that means "the caller has finished"
-PARTIAL_INTERVAL = 0.9       # how often the live transcript is refreshed while speaking
-MAX_SPEECH_SECONDS = 30      # longest single answer that is listened to
-STAGNANT_SECONDS = 4.0       # live text did not change for this long: treat the speech as finished
-_MIC_CACHE = {"energy": None}  # microphone noise level, measured once per call
+if API_KEY:
+    log.info("Using model %s", MODEL)
 
 GOODBYE_WORDS = {"bye", "bye bye", "goodbye", "exit", "quit", "बाय", "बाय बाय", "अलविदा"}
 
@@ -67,24 +63,11 @@ BREVITY_NOTE = (
     "Do not repeat the caller's question back.")
 
 
-
-# Loudness of an audio buffer (audioop is missing in newer Python versions)
-try:
-    import audioop
-
-    def _rms(buf: bytes) -> float:
-        return audioop.rms(buf, 2)
-except ImportError:
-    from array import array
-
-    def _rms(buf: bytes) -> float:
-        samples = array("h", buf)
-        return (sum(x * x for x in samples) / max(1, len(samples))) ** 0.5
-
-
 # =============================================================== 2. LANGUAGES
 # Each language has: label (shown in the UI), stt (speech-recognition code), tts (voice
-# language code for gTTS), and the fixed phone sentences.
+# language code for gTTS), note (extra AI instruction) and the fixed phone sentences.
+DEFAULT_LANGUAGE = "English (India)"
+
 ENGLISH_TEXTS = {
     "greeting": "Hello. Thank you for calling. How may I help you?",
     "not_heard": "Sorry, I didn't catch that. Could you repeat?",
@@ -165,19 +148,28 @@ def _language_note(name: str, script: str) -> str:
             "Raise Ticket in English.")
 
 
-LANGUAGES = {"English (India)": {"label": "English (India)", "stt": "en-IN", "tts": "en",
-                                 "note": "", **ENGLISH_TEXTS}}
-for _name, _cfg in _INDIAN_LANGUAGES.items():
-    _cfg["note"] = _language_note(_name, _cfg.pop("script"))
-    LANGUAGES[_name] = _cfg
+def _build_languages() -> dict:
+    """Combine English + Indian languages into one table (the source dicts are not modified)."""
+    table = {DEFAULT_LANGUAGE: {"label": DEFAULT_LANGUAGE, "stt": "en-IN", "tts": "en",
+                                "note": "", **ENGLISH_TEXTS}}
+    for name, cfg in _INDIAN_LANGUAGES.items():
+        cfg = dict(cfg)                      # copy: do not change the original
+        script = cfg.pop("script")
+        cfg["note"] = _language_note(name, script)
+        table[name] = cfg
+    return table
 
-DEFAULT_LANGUAGE = "English (India)"
+
+LANGUAGES = _build_languages()
+
+
+def _lang(language: str) -> dict:
+    """Settings for a language; falls back to the default for unknown names."""
+    return LANGUAGES.get(language) or LANGUAGES[DEFAULT_LANGUAGE]
+
 
 # ============================================================ 3. SYSTEM PROMPT
-with open(KB_FILE, encoding="utf-8") as f:
-    KNOWLEDGE_BASE = f.read()
-
-SYSTEM_PROMPT = f"""You are the voice assistant for Ankesh Software Solutions, makers of the Customer & Contract Management System (CCMS). You answer product questions, guide callers through how to use CCMS, and log support or callback requests. Use ONLY the knowledge base at the end of this prompt for facts about the company and product.
+_PROMPT_TEMPLATE = """You are the voice assistant for Ankesh Software Solutions, makers of the Customer & Contract Management System (CCMS). You answer product questions, guide callers through how to use CCMS, and log support or callback requests. Use ONLY the knowledge base at the end of this prompt for facts about the company and product.
 
 VOICE STYLE
 - You are speaking on a phone call. Reply in one or two short, natural sentences.
@@ -222,29 +214,78 @@ NEVER
 Close the call politely once the caller's needs are met.
 
 KNOWLEDGE BASE:
-{KNOWLEDGE_BASE}
 """
 
 
-# ====================================================================== 4. TOOL
-def save_appointment_request(name: str, phone: str, service: str,
-                             preferred_date: str, preferred_time: str,
-                             status: str = "New request") -> dict:
-    """Save an appointment request AFTER the caller has confirmed the details.
+def config_problem():
+    """Returns a human-readable problem with the setup, or None when everything is fine."""
+    if not API_KEY:
+        return "GEMINI_API_KEY is missing. Add it to your .env file and restart the app."
+    if not os.path.exists(KB_FILE):
+        return f"knowledge_base.md was not found. Put it next to agent.py ({KB_FILE})."
+    return None
 
-    Use status "Needs human follow-up" when escalating to a human.
+
+def is_configured() -> bool:
+    """True when the agent can start (API key + knowledge base file present)."""
+    return config_problem() is None
+
+
+def build_system_prompt() -> str:
+    """Prompt + knowledge base. Read at the start of every conversation, so edits to
+    knowledge_base.md apply to the next call without restarting the app."""
+    with open(KB_FILE, encoding="utf-8") as f:
+        return _PROMPT_TEMPLATE + f.read()
+
+
+# ====================================================================== 4. TOOL
+_CSV_LOCK = threading.Lock()     # many callers can save at the same time on a live server
+_turn = threading.local()        # per-thread flag: did the current turn save a request?
+
+
+def _csv_safe(value) -> str:
+    """Stop spreadsheet formula injection: a cell starting with = + - @ would run as a formula.
+    Plain phone numbers (digits, spaces, dashes, optional leading +) are left untouched."""
+    value = str(value or "").strip()
+    if re.fullmatch(r"\+?[\d\s\-]+", value):
+        return value
+    return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
+
+def save_appointment_request(name: str, phone: str, service: str,
+                             preferred_date: str = "", preferred_time: str = "",
+                             status: str = "New request") -> dict:
+    """Save a support / callback request AFTER the caller has confirmed the details.
+
+    Args:
+        name: caller's full name.
+        phone: caller's phone number.
+        service: short description of the issue or request (and organization name).
+        preferred_date: preferred callback date, if the caller gave one (may be empty).
+        preferred_time: preferred callback time.
+        status: "New request", or "Needs human follow-up" when escalating to a human.
     """
+    if not str(name).strip() or not str(phone).strip():
+        return {"saved_locally": False, "synced_to_sheet": False,
+                "error": "name and phone are required: ask the caller for them first"}
+
     row = [datetime.datetime.now().isoformat(timespec="seconds"),
-           name, phone, service, preferred_date, preferred_time, status]
+           _csv_safe(name), _csv_safe(phone), _csv_safe(service),
+           _csv_safe(preferred_date), _csv_safe(preferred_time), _csv_safe(status)]
 
     # 1) Local CSV backup (always)
-    new_file = not os.path.exists(CSV_FILE)
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if new_file:
-            writer.writerow(["Timestamp", "Name", "Phone", "Service",
-                             "Preferred Date", "Preferred Time", "Status"])
-        writer.writerow(row)
+    try:
+        with _CSV_LOCK:
+            new_file = not os.path.exists(CSV_FILE)
+            with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(["Timestamp", "Name", "Phone", "Service",
+                                     "Preferred Date", "Preferred Time", "Status"])
+                writer.writerow(row)
+    except OSError as e:   # e.g. read-only disk, or the CSV is open in Excel
+        log.exception("Could not write %s", CSV_FILE)
+        return {"saved_locally": False, "synced_to_sheet": False, "error": str(e)}
 
     # 2) Google Sheet via Apps Script webhook (optional)
     synced = False
@@ -255,103 +296,160 @@ def save_appointment_request(name: str, phone: str, service: str,
                 "date": preferred_date, "time": preferred_time, "status": status,
             }, timeout=15)
             synced = r.ok
-        except requests.RequestException:
-            pass
+            if not r.ok:
+                log.warning("Sheet webhook answered HTTP %s", r.status_code)
+        except requests.RequestException as e:
+            log.warning("Sheet webhook failed: %s", e)
+
+    _turn.saved = True      # tells SupportAgent that this turn saved a request
+    log.info("Request saved (status=%s, synced=%s)", status, synced)
     return {"saved_locally": True, "synced_to_sheet": synced}
 
 
 def count_saved_requests() -> int:
-    """Number of lines in the CSV log (the UI uses it to notice a new save)."""
+    """Number of lines in the CSV log."""
     if not os.path.exists(CSV_FILE):
         return 0
-    with open(CSV_FILE, encoding="utf-8") as f:
-        return sum(1 for _ in csv.reader(f))
-
-
-def is_configured() -> bool:
-    """True when a Gemini API key is available."""
-    return bool(API_KEY)
+    try:
+        with open(CSV_FILE, encoding="utf-8", newline="") as f:
+            return sum(1 for _ in csv.reader(f))
+    except OSError:
+        return 0
 
 
 # ============================================================== 5. SUPPORT AGENT
-def _shorten(text: str, max_words: int = 35, max_sentences: int = 2) -> str:
-    """Safety net: if a reply is still too long for a phone call, keep the first
-    sentence or two (and the closing question, if there is one)."""
-    text = " ".join(text.split())
-    if len(text.split()) <= max_words:
-        return text
-    sentences = re.split(r"(?<=[.!?।])\s+", text)
-    kept, count = [], 0
-    for s in sentences:
-        n = len(s.split())
-        if kept and (len(kept) >= max_sentences or count + n > max_words):
-            break
-        kept.append(s)
-        count += n
-    last = sentences[-1]
-    if last not in kept and last.endswith("?") and count + len(last.split()) <= max_words + 12:
-        kept.append(last)
-    return " ".join(kept)
+_SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")   # split points between sentences
+
+
+def fixed_events(text: str, ended: bool):
+    """A ready-made reply (greeting, 'not heard', goodbye ...) in the same event format as a streamed one."""
+    yield "sentence", text
+    yield "end", {"ended": ended, "saved": False}
+
+
+def _chunk_text(chunk) -> str:
+    """Text of one streamed Gemini chunk ('' for chunks that only carry a tool call)."""
+    try:
+        return chunk.text or ""
+    except Exception:
+        return ""
 
 
 class SupportAgent:
-    """One conversation = one SupportAgent. It remembers what was said."""
+    """One conversation = one SupportAgent. It remembers what was said.
+
+    Streaming events (same for chat and call):
+        ("sentence", "text")                      one finished sentence, send it to the caller at once
+        ("end", {"ended": bool, "saved": bool})   the turn is over (ended = hang up, saved = request saved)
+    """
 
     def __init__(self, language: str = DEFAULT_LANGUAGE):
-        if not API_KEY:
-            raise RuntimeError("GEMINI_API_KEY is missing. Add it to your .env file.")
+        problem = config_problem()
+        if problem:
+            raise RuntimeError(problem)
         self.language = language if language in LANGUAGES else DEFAULT_LANGUAGE
         self._cfg = LANGUAGES[self.language]
         self.greeting = self._cfg["greeting"]
         self.misses = 0      # times speech was heard but not understood
         self.silences = 0    # times the caller said nothing at all
-        _MIC_CACHE["energy"] = None  # new call: measure the room noise again
+        self._instruction = build_system_prompt() + self._cfg["note"] + BREVITY_NOTE
         # Keep a reference to the client. If it is garbage-collected, the SDK
         # closes its HTTP connection ("client has been closed" error).
         self._client = genai.Client(api_key=API_KEY)
         self._thinking_off = "flash" in MODEL.lower()   # faster replies: no hidden "thinking" step
         self._chat = self._new_chat()
 
-    def _new_chat(self):
-        cfg = dict(system_instruction=SYSTEM_PROMPT + self._cfg["note"] + BREVITY_NOTE,
+    def _new_chat(self, history=None):
+        cfg = dict(system_instruction=self._instruction,
                    tools=[save_appointment_request],  # the SDK calls it automatically
                    temperature=0.3)
         if self._thinking_off:
             try:
                 cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
             except Exception:
-                pass
-        return self._client.chats.create(model=MODEL, config=types.GenerateContentConfig(**cfg))
+                log.debug("ThinkingConfig not supported by this SDK version", exc_info=True)
+        return self._client.chats.create(model=MODEL, history=history,
+                                         config=types.GenerateContentConfig(**cfg))
 
-    def send(self, text: str) -> str:
-        """Send the caller's words to Gemini, get a short reply."""
+    def _chunks(self, text: str):
+        """Raw streamed chunks from Gemini (with the 'thinking' fallback)."""
         try:
-            reply = self._chat.send_message(text)
+            yield from self._chat.send_message_stream(text)
         except Exception as e:
             if not (self._thinking_off and "thinking" in str(e).lower()):
+                log.exception("Gemini request failed")
                 raise
             # this model does not allow thinking_budget=0: start again without it
+            log.info("Model rejects thinking_budget=0, retrying without it")
+            try:
+                history = self._chat.get_history()
+            except Exception:
+                history = None
             self._thinking_off = False
-            self._chat = self._new_chat()
-            reply = self._chat.send_message(text)
-        return _shorten(reply.text or "Sorry, could you say that again?")
+            self._chat = self._new_chat(history)
+            yield from self._chat.send_message_stream(text)
 
-    def hear(self, heard: str):
-        """One turn where the caller DID speak. `heard` is "" when the speech could
-        not be understood. Returns (reply_text, call_ended)."""
+    def send_stream(self, text: str):
+        """Send the caller's words to Gemini and yield the reply one finished sentence at a time,
+        so the browser can start speaking after the FIRST sentence (this is what removes the wait)."""
+        log.debug("caller: %s", text)
+        buf, emitted = "", 0
+        for chunk in self._chunks(text):
+            piece = _chunk_text(chunk)
+            if not piece:
+                continue
+            buf += piece
+            *finished, buf = _SENTENCE_END.split(buf)     # the last part may still be incomplete
+            for sentence in finished:
+                sentence = sentence.strip()
+                if sentence and emitted < MAX_REPLY_SENTENCES:
+                    emitted += 1
+                    log.debug("agent: %s", sentence)
+                    yield sentence
+        tail = buf.strip()
+        if tail and emitted < MAX_REPLY_SENTENCES:
+            emitted += 1
+            log.debug("agent: %s", tail)
+            yield tail
+        if emitted == 0:
+            yield self._cfg["not_heard"]
+
+    def send(self, text: str) -> str:
+        """Same as send_stream but returns the whole reply as one string."""
+        return " ".join(self.send_stream(text))
+
+    def hear_stream(self, heard: str):
+        """One turn where the caller DID speak (or typed). `heard` is "" when the speech could
+        not be understood. Yields the streaming events described in the class docstring."""
         self.silences = 0
         if not heard:
             self.misses += 1
             if self.misses >= 2:
-                return self._cfg["trouble"], True
-            return self._cfg["not_heard"], False
+                yield from fixed_events(self._cfg["trouble"], True)
+            else:
+                yield from fixed_events(self._cfg["not_heard"], False)
+            return
         self.misses = 0
         if heard.lower().strip(" .!।") in GOODBYE_WORDS:
-            return self._cfg["bye"], True
-        return self.send(heard), False
+            yield from fixed_events(self._cfg["bye"], True)
+            return
+        _turn.saved = False
+        for sentence in self.send_stream(heard):
+            yield "sentence", sentence
+        yield "end", {"ended": False, "saved": getattr(_turn, "saved", False)}
+
+    def hear(self, heard: str):
+        """Non-streaming version of hear_stream. Returns (reply_text, call_ended)."""
+        parts, ended = [], False
+        for kind, value in self.hear_stream(heard):
+            if kind == "sentence":
+                parts.append(value)
+            else:
+                ended = value["ended"]
+        return " ".join(parts), ended
 
     def silence(self):
-        """One turn where the caller said NOTHING for SILENCE_WAIT_SECONDS.
+        """One turn where the caller said NOTHING for the silence time (the browser measures it).
         First time: ask if they are still there. Second time: end the call.
         Returns (reply_text, call_ended)."""
         self.silences += 1
@@ -359,36 +457,15 @@ class SupportAgent:
             return self._cfg["no_response"], True
         return self._cfg["still_there"], False
 
+    def silence_stream(self):
+        """Streaming-format version of silence()."""
+        text, ended = self.silence()
+        yield from fixed_events(text, ended)
 
-# ================================================================= 6. SPEAKING
-# The voice runs in a separate process, so the screen never freezes while it talks.
-# Steps inside that process: load the libraries -> wait for the text -> ask Google
-# (gTTS) for the audio -> play it with pygame.
-_SPEAK_CODE = r"""
-import io, json, os, sys
-sys.stdin.reconfigure(encoding="utf-8")            # the text arrives as UTF-8
-os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
-import pygame
-from gtts import gTTS
 
-pygame.mixer.init()                                # warm-up: done before the text arrives
-text = json.loads(sys.stdin.read())                # waits here until speak_send() gives the text
-if text:
-    audio = io.BytesIO()
-    gTTS(text=text, lang=sys.argv[1]).write_to_fp(audio)
-    try:                                           # how long the audio is (for the typing effect)
-        length = pygame.mixer.Sound(file=io.BytesIO(audio.getvalue())).get_length()
-    except Exception:
-        length = 0
-    audio.seek(0)
-    pygame.mixer.music.load(audio, "mp3")
-    print(length, flush=True)                      # tells the app: audio is ready, playing NOW
-    pygame.mixer.music.play()
-    while pygame.mixer.music.get_busy():
-        pygame.time.wait(100)
-"""
-
-# Hindi voice reads English words badly, so spell them in Devanagari before speaking.
+# ============================================================ 6. SPEECH HELPERS
+# The browser reads the reply aloud. Hindi voices read English words badly, so they are spelled in
+# Devanagari in the text that is SPOKEN (the text that is SHOWN stays as written).
 HINDI_PRONUNCIATION = {
     "Ankesh Software Solutions": "अंकेश सॉफ्टवेयर सॉल्यूशंस",
     "CCMS": "सी सी एम एस",
@@ -399,7 +476,7 @@ HINDI_PRONUNCIATION = {
 }
 
 
-def _speech_text(text: str, language: str) -> str:
+def speech_text(text: str, language: str) -> str:
     """The text exactly as it should be spoken."""
     if language == "Hindi":
         for written, spoken in HINDI_PRONUNCIATION.items():
@@ -407,347 +484,30 @@ def _speech_text(text: str, language: str) -> str:
     return text
 
 
-def speak_prepare(language: str = DEFAULT_LANGUAGE) -> subprocess.Popen:
-    """Start the voice process now and wait for the text (see speak_send).
-    Call this while listening or thinking, so the reply starts speaking at once."""
-    tts_code = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])["tts"]
-    proc = subprocess.Popen([sys.executable, "-c", _SPEAK_CODE, tts_code],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            text=True, encoding="utf-8")   # errors of the voice show in the console
-    proc.language = language                               # remembered for speak_send()
-    return proc
+def client_languages() -> dict:
+    """What the browser needs to know about each language: label, speech-recognition code and
+    voice code. (The sentences themselves always come from the server.)"""
+    return {name: {"label": cfg["label"], "stt": cfg["stt"], "tts": cfg["tts"]}
+            for name, cfg in LANGUAGES.items()}
 
 
-def speak_send(proc: subprocess.Popen, text: str) -> None:
-    """Give the prepared voice its text; it starts speaking immediately."""
-    try:
-        # json.dumps (default) turns Hindi etc. into \uXXXX codes, so no encoding problems
-        proc.stdin.write(json.dumps(_speech_text(text, proc.language)))
-        proc.stdin.close()
-    except (OSError, ValueError):
-        pass  # the voice process died: speak_finish() will report it
-
-
-def speak_wait_start(proc: subprocess.Popen) -> float:
-    """Wait until the audio is ready and playing. Returns its length in seconds,
-    or 0 if unknown (e.g. the voice failed; speak_finish() will report that)."""
-    try:
-        return float(proc.stdout.readline())
-    except (ValueError, OSError):
-        return 0.0
-
-
-def speak_start(text: str, language: str = DEFAULT_LANGUAGE) -> subprocess.Popen:
-    """Start speaking and return immediately."""
-    proc = speak_prepare(language)
-    speak_send(proc, text)
-    return proc
-
-
-def speak_cancel(proc: subprocess.Popen) -> None:
-    """Throw away a prepared voice that was not needed."""
-    try:
-        proc.stdin.close()
-    except (OSError, ValueError, AttributeError):
-        pass
-    if proc.poll() is None:
-        proc.terminate()
-
-
-def speak_finish(proc: subprocess.Popen) -> None:
-    """Wait until speaking is done. Raises RuntimeError if it failed."""
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError("Could not speak the reply. Check your internet connection and "
-                           "that gTTS and pygame are installed (pip install gTTS pygame).")
-
-
-def speak_stop(proc: subprocess.Popen) -> None:
-    """Stop speaking now (safe to call even if it already finished)."""
-    if proc.poll() is None:
-        proc.terminate()
-
-
-def speak_local(text: str, language: str = DEFAULT_LANGUAGE) -> None:
-    """Speak and wait until finished."""
-    speak_finish(speak_start(text, language))
-
-def tts_bytes(text: str, language: str = DEFAULT_LANGUAGE) -> bytes:
-    """Reply text -> MP3 bytes for the browser to play (works on any OS, no pygame)."""
-    from gtts import gTTS
-    code = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])["tts"]
-    buf = io.BytesIO()
-    gTTS(text=_speech_text(text, language), lang=code).write_to_fp(buf)
-    return buf.getvalue()
-
-
-def transcribe_audio(wav_bytes: bytes, language: str = DEFAULT_LANGUAGE) -> str:
-    """WAV recorded in the browser -> text (no PyAudio). Returns "" if not understood."""
-    import speech_recognition as sr
-    rec = sr.Recognizer()
-    try:
-        with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
-            audio = rec.record(source)
-        return rec.recognize_google(audio, language=LANGUAGES[language]["stt"])
-    except (sr.UnknownValueError, sr.RequestError, ValueError):
-        return ""
-
-# ================================================================ 7. LISTENING
-def _open_microphone(sr):
-    try:
-        return sr.Microphone()
-    except (OSError, AttributeError) as e:
-        raise RuntimeError("Microphone not available. Check that a microphone is "
-                           "connected and PyAudio is installed.") from e
-
-
-def listen_once(language: str = DEFAULT_LANGUAGE, timeout: int = 20,
-                phrase_time_limit: int = 60, tick=None) -> str:
-    """Listen once (used by the terminal version). Returns the text, or "" if nothing
-    was heard or understood. Raises RuntimeError if there is no microphone."""
-    import speech_recognition as sr
-    rec = sr.Recognizer()
-    rec.dynamic_energy_threshold = True
-    rec.pause_threshold = 1.2
-    rec.non_speaking_duration = 0.6
-    mic = _open_microphone(sr)
-    with mic as source:
-        rec.adjust_for_ambient_noise(source, duration=0.5)
-        audio = None
-        for _ in range(max(1, int(timeout))):
-            try:
-                audio = rec.listen(source, timeout=1, phrase_time_limit=phrase_time_limit)
-                break
-            except sr.WaitTimeoutError:
-                if tick:
-                    tick()
-        if audio is None:
-            return ""
-    try:
-        return rec.recognize_google(audio, language=LANGUAGES[language]["stt"])
-    except (sr.UnknownValueError, sr.RequestError):
-        return ""
-
-
-class _Transcriber:
-    """Turns audio into text in a background thread, so the listening loop never waits.
-
-    Each time the caller starts a new utterance, `reset()` is called. A result from an
-    older utterance (older `gen`) is thrown away.
-      text    - latest transcript         covered - how many frames that transcript covers
-      busy    - a request is running      failed  - the speech service could not be reached
-    """
-
-    def __init__(self, sr, recognizer, language_code: str, rate: int, width: int):
-        self.sr, self.rec, self.lang = sr, recognizer, language_code
-        self.rate, self.width = rate, width
-        self.lock = threading.Lock()
-        self.text, self.covered, self.busy, self.failed, self.gen = "", 0, False, False, 0
-
-    def transcribe(self, pcm: bytes):
-        """Blocking. Returns the text, "" if not understood, None if the service is unreachable."""
-        audio = self.sr.AudioData(pcm, self.rate, self.width)
-        for _ in range(3):
-            try:
-                return self.rec.recognize_google(audio, language=self.lang)
-            except self.sr.UnknownValueError:
-                return ""
-            except self.sr.RequestError:
-                time.sleep(0.3)
-        return None
-
-    def start(self, frames: list, n_frames: int) -> None:
-        """Transcribe the first `n_frames` frames in the background."""
-        with self.lock:
-            self.busy = True
-            gen = self.gen
-        threading.Thread(target=self._work, daemon=True,
-                         args=(b"".join(frames[:n_frames]), n_frames, gen)).start()
-
-    def _work(self, pcm: bytes, n_frames: int, gen: int) -> None:
-        text = self.transcribe(pcm)
-        with self.lock:
-            if gen == self.gen:              # ignore results that belong to an earlier utterance
-                if text is None:
-                    self.failed = True
-                else:
-                    self.text, self.failed = text, False
-                self.covered = n_frames
-            self.busy = False
-
-    def reset(self) -> None:
-        with self.lock:
-            self.text, self.covered, self.failed = "", 0, False
-            self.gen += 1
-
-    def snapshot(self):
-        """(busy, covered, text, failed) read together."""
-        with self.lock:
-            return self.busy, self.covered, self.text, self.failed
-
-
-def listen_live(on_partial=None, language: str = DEFAULT_LANGUAGE,
-                timeout: int = SILENCE_WAIT_SECONDS, tick=None):
-    """Listen on the microphone and report the words WHILE the caller speaks.
-
-    The microphone is read in small frames. Speech starts when the sound is clearly
-    louder than the room, and ends after END_OF_SPEECH_SECONDS of quiet. Everything
-    said so far is transcribed again about once a second, so the last live text is
-    also the final text.
-
-    Safety: a frame only counts as speech if it is also loud compared with the caller's
-    own voice, so steady background noise cannot keep the microphone "open". If the live
-    text stops changing for STAGNANT_SECONDS, or the answer is longer than
-    MAX_SPEECH_SECONDS, listening ends anyway.
-
-    on_partial(text) is called when the live text changes.
-    tick() is called about twice a second so a UI can stay responsive.
-
-    Returns (text, spoke):
-      ("hello", True)  the caller spoke and it was understood
-      ("", True)       the caller spoke but it could not be understood
-      ("", False)      the caller said nothing for `timeout` seconds
-    Raises RuntimeError if there is no microphone or the speech service is unreachable."""
-    import speech_recognition as sr
-
-    rec = sr.Recognizer()
-    mic = _open_microphone(sr)
-
-    frames = []        # audio frames of the current utterance (starts with a short pre-roll)
-    last_voiced = 0    # number of frames up to the last one that really contained speech
-
-    with mic as source:
-        rate, width, chunk = source.SAMPLE_RATE, source.SAMPLE_WIDTH, source.CHUNK
-        frame_sec = chunk / rate
-        transcriber = _Transcriber(sr, rec, LANGUAGES[language]["stt"], rate, width)
-
-        if _MIC_CACHE["energy"] is None:      # measure the room noise once per call
-            rec.adjust_for_ambient_noise(source, duration=0.5)
-            _MIC_CACHE["energy"] = rec.energy_threshold
-        threshold = _MIC_CACHE["energy"]
-
-        preroll = deque(maxlen=max(1, int(0.4 / frame_sec)))  # sound just before speech started
-        speaking = False
-        voiced = 0            # how many frames contained speech
-        silence = 0.0         # seconds of quiet since the last speech frame
-        waited = 0.0          # seconds waited for the caller to start
-        level = 0.0           # how loud the caller's voice is
-        last_req = last_tick = speech_start = last_change = 0.0
-        shown = ""            # live text currently shown on screen
-
-        try:
-            while True:
-                buf = source.stream.read(chunk)
-                if not buf:
-                    break
-                energy, now = _rms(buf), time.time()
-                if tick and now - last_tick >= 0.5:
-                    tick()
-                    last_tick = now
-
-                # ---- waiting for the caller to start speaking
-                if not speaking:
-                    if energy > threshold:
-                        speaking, frames = True, list(preroll) + [buf]
-                        voiced, last_voiced, silence, level = 1, len(frames), 0.0, float(energy)
-                        speech_start = last_change = now
-                        transcriber.reset()
-                        shown = ""
-                    else:
-                        preroll.append(buf)
-                        # slowly adapt the noise threshold to the room
-                        damping = rec.dynamic_energy_adjustment_damping ** frame_sec
-                        threshold = threshold * damping + energy * rec.dynamic_energy_ratio * (1 - damping)
-                        waited += frame_sec
-                        if waited >= timeout:
-                            return "", False
-                    continue
-
-                # ---- the caller is speaking
-                frames.append(buf)
-                if energy > threshold and energy > 0.4 * level:   # loud, and close to the caller's own level
-                    voiced, last_voiced, silence = voiced + 1, len(frames), 0.0
-                    level = 0.9 * level + 0.1 * energy
-                else:
-                    silence += frame_sec
-                    if silence >= 0.6 and voiced * frame_sec < 0.25:   # a click or noise, not speech
-                        speaking, frames = False, []
-                        preroll.clear()
-                        transcriber.reset()
-                        if shown and on_partial:
-                            on_partial("")
-                        shown = ""
-                        continue
-
-                # ---- refresh the live transcript with everything said so far
-                busy, covered, text, _ = transcriber.snapshot()
-                if not busy and covered < last_voiced and (silence > 0 or now - last_req >= PARTIAL_INTERVAL):
-                    transcriber.start(frames, last_voiced)
-                    last_req = now
-                if text != shown:
-                    shown, last_change = text, now
-                    if on_partial:
-                        on_partial(text)
-
-                # ---- has the caller finished?
-                too_long = len(frames) * frame_sec >= MAX_SPEECH_SECONDS
-                stagnant = (now - last_change >= STAGNANT_SECONDS) if shown else (now - speech_start >= 8.0)
-                if silence >= END_OF_SPEECH_SECONDS or too_long or (stagnant and not busy):
-                    break
-        finally:
-            _MIC_CACHE["energy"] = threshold   # remember the room noise level for the next turn
-
-    if not frames:
-        return "", False
-
-    # wait for the transcript that is already being made
-    while transcriber.snapshot()[0]:
-        if tick:
-            tick()
-        time.sleep(0.03)
-    _, covered, text, failed = transcriber.snapshot()
-
-    if covered < last_voiced or failed:       # not everything was transcribed yet: do it now
-        text = transcriber.transcribe(b"".join(frames[:last_voiced]))
-        if text is None:
-            raise RuntimeError("The speech service could not be reached. Check your internet connection.")
-    if on_partial and text != shown:
-        on_partial(text)
-    return text, True
-
-
-# ========================================================== 8. TERMINAL VERSION
-def _say(text: str, voice_mode: bool, language: str = DEFAULT_LANGUAGE) -> None:
-    print(f"\nAgent: {text}")
-    if voice_mode:
-        speak_local(text, language)
-
-
-def _hear(voice_mode: bool) -> str:
-    if not voice_mode:
-        return input("You: ").strip()
-    print("\n[Listening...]")
-    text = listen_once()
-    if text:
-        print(f"You: {text}")
-    return text
-
-
+# ========================================================== 7. TERMINAL VERSION
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--text", action="store_true", help="type instead of speaking")
-    voice_mode = not parser.parse_args().text
-
-    if not API_KEY:
-        raise SystemExit("Set GEMINI_API_KEY in your .env file first.")
-
+    """Quick text test without a browser: python agent.py"""
+    argparse.ArgumentParser(description="Text-only test of the support agent").parse_args()
+    problem = config_problem()
+    if problem:
+        raise SystemExit(problem)
     agent = SupportAgent()
-    _say(agent.greeting, voice_mode, agent.language)
-    while True:
-        reply, ended = agent.hear(_hear(voice_mode))
-        _say(reply, voice_mode, agent.language)
-        if ended:
-            break
+    print(f"\nAgent: {agent.greeting}")
+    try:
+        while True:
+            reply, ended = agent.hear(input("You: ").strip())
+            print(f"\nAgent: {reply}")
+            if ended:
+                break
+    except (KeyboardInterrupt, EOFError):
+        print("\nChat ended.")
 
 
 if __name__ == "__main__":

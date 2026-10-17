@@ -1,8 +1,6 @@
-streamlit
-google-genai
-python-dotenv
-requests
-SpeechRecognition
-gTTS
-PyAudio; platform_system == "Windows"
-pygame; platform_system == "Windows"
+fastapi>=0.110
+uvicorn[standard]>=0.29
+google-genai>=1.0
+python-dotenv>=1.0
+requests>=2.31
+gTTS>=2.5        # optional: server voice fallback for browsers without a voice for the chosen language

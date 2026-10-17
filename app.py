@@ -1,432 +1,203 @@
-"""UI only. All logic lives in agent.py, all styling lives in styles.css.
+"""Web server for the CCMS support agent. Run:  uvicorn app:app --host 0.0.0.0 --port 8000
 
-Run:  streamlit run app.py
-- Header (top right): the language icon.
-- Bottom centre: the green Call and blue Chat buttons.
-- Call: the agent speaks first (its text types out in step with its voice), then
-  listens (your words appear live). If you say nothing it asks "Are you still
-  there?", and if there is still no answer it ends the call.
-- Chat: a normal text chatbot.
-Runs on your own computer (uses this PC's microphone and speakers).
+The BROWSER does the audio (speech-to-text and text-to-speech, see static/index.html).
+This server only moves TEXT, and streams the reply back sentence by sentence.
+All logic lives in agent.py; chat and call use the same messages.
 
 File map (top to bottom):
-  1. Settings        4. Page layout (header, chat panel, bottom bar)
-  2. State           5. Chat mode  (typed messages)
-  3. Draw helpers    6. Call mode  (voice loop)
+  1. Settings
+  2. Pages and small APIs   GET /  /health  /api/config  /api/tts
+  3. Conversation socket    WebSocket /ws
+
+WebSocket messages
+  browser -> server                                server -> browser
+  {"type":"start","lang":"Hindi"}                  {"type":"sentence","text":"...","say":"..."}   (many)
+  {"type":"text","text":"caller words"}            {"type":"end","ended":false,"saved":false}     (turn over)
+  {"type":"unheard"}   speech heard, not understood {"type":"error","message":"..."}
+  {"type":"silence"}   caller said nothing
+  {"type":"end"}       caller hung up
+Every browser message gets an answer made of sentence events followed by one end event.
 """
-import html
+import asyncio
+import io
+import logging
 import os
-import time
+import threading
 
-import streamlit as st
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response
 
-import agent  # backend: SupportAgent, speak_prepare, listen_live, ...
-   
-st.set_page_config(page_title="Ankesh Software Solutions | Support",
-                   page_icon="🎧", layout="centered")
+import agent
+
+log = logging.getLogger("ccms.web")
 
 # ================================================================= 1. SETTINGS
-HEADSET = ('<svg width="{s}" height="{s}" viewBox="0 0 24 24" fill="#ffffff"><path d="M12 1c-4.97 0-9 4.03-9 9v7c0 '
-           '1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h4v1h-7v2h6c1.66 0 3-1.34 3-3V10c0-4.97-4.03-9-9-9z"/></svg>')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INDEX_FILE = os.path.join(BASE_DIR, "static", "index.html")
 
-# Layout: the header and the footer run the full width of the window. The chat panel and the
-# footer controls share one centred column (same left and right edges), with space on both sides.
-GUT = "max(12px, calc((100% - 820px) / 2))"   # side space that keeps the column at most 820 px wide
-HEADER_H = 70         # header height on a computer screen (px)  <- change this to make the header taller or shorter
-HEADER_H_MOBILE = 54  # header height on a phone (px)
-TOP_H = HEADER_H + 10         # where the chat panel starts
-TOP_H_MOBILE = HEADER_H_MOBILE
+SILENCE_WAIT_SECONDS = 15   # browser: how long to wait for the caller to start speaking
+MAX_TEXT_CHARS = 1000       # longest message accepted from a caller
+MAX_TURNS = 200             # most messages in one conversation (protects your Gemini quota)
+TTS_MAX_CHARS = 400         # longest text for the optional server voice (/api/tts)
 
-BAR_HEIGHT = {"idle": 126, "call": 126, "chat": 104}   # bottom bar height per mode (px)
-SECONDS_PER_WORD = 0.30     # voice pace used to time the typing effect
-VOICE_START_DELAY = 0.1     # small delay between 'audio ready' and the voice being heard
-GLIDE_CHARS = 3             # characters added per typing step
+# One-tap questions on the welcome screen. Edit to match knowledge_base.md.
+# A language without its own list uses the English one (the agent still answers in that language).
+QUICK_QUESTIONS = {
+    "English (India)": [
+        "What is CCMS?",
+        "How do I add a customer?",
+        "How do I raise a support ticket?",
+        "I forgot my password",
+        "I want a callback from the support team",
+    ],
+    "Hindi": [
+        "CCMS क्या है?",
+        "कस्टमर कैसे जोड़ें?",
+        "सपोर्ट टिकट कैसे बनाएं?",
+        "मैं अपना पासवर्ड भूल गया",
+        "मुझे सपोर्ट टीम से कॉलबैक चाहिए",
+    ],
+}
 
-# Keeps the chat window scrolled to the newest message (unless you scroll up to read)
-SCROLL_JS = """
-<script>
-(function () {
-  var P = window.parent;
-  if (P.__chatScrollInstalled) return;
-  P.__chatScrollInstalled = true;
-  var code = '(' + function () {
-    var stick = true, cached = null;
-    function scroller() {
-      if (cached && document.contains(cached) && cached.scrollHeight > cached.clientHeight + 2) return cached;
-      var box = document.querySelector('.st-key-chatbox');
-      if (!box) return null;
-      var list = [box].concat(Array.prototype.slice.call(box.querySelectorAll('div')));
-      for (var i = 0; i < list.length; i++) {
-        var o = getComputedStyle(list[i]).overflowY;
-        if ((o === 'auto' || o === 'scroll') && list[i].scrollHeight > list[i].clientHeight + 2) { cached = list[i]; return cached; }
-      }
-      return box;
+app = FastAPI(title="CCMS Support Agent")
+
+
+# ======================================================== 2. PAGES AND SMALL APIS
+@app.get("/")
+def home():
+    """The chat / call page."""
+    return FileResponse(INDEX_FILE)
+
+
+@app.get("/health")
+def health():
+    """For the hosting platform's health check."""
+    return {"ok": True, "configured": agent.is_configured()}
+
+
+@app.get("/api/config")
+def config():
+    """Everything the page needs to draw itself."""
+    return {
+        "problem": agent.config_problem(),          # None, or a message to show instead of the app
+        "default_language": agent.DEFAULT_LANGUAGE,
+        "languages": agent.client_languages(),      # label + speech-recognition code + voice code
+        "quick_questions": QUICK_QUESTIONS,
+        "silence_wait": SILENCE_WAIT_SECONDS,
     }
-    document.addEventListener('scroll', function (e) {
-      var el = e.target;
-      if (el && el.nodeType === 1 && el.closest && el.closest('.st-key-chatbox')) {
-        stick = (el.scrollHeight - el.scrollTop - el.clientHeight) < 100;
-      }
-    }, true);
-    var pending = false;
-    new MutationObserver(function () {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(function () {
-        pending = false;
-        var el = scroller();
-        if (el && stick) el.scrollTop = el.scrollHeight;
-      });
-    }).observe(document.body, {childList: true, subtree: true, characterData: true});
-  }.toString() + ')();';
-  var s = P.document.createElement('script');
-  s.textContent = code;
-  P.document.head.appendChild(s);
-})();
-</script>
-"""
 
 
-def load_css() -> str:
-    """Read styles.css and fill in the sizes. (Mobile names first: "TOPH" is part of "MTOPH".)"""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "styles.css")
-    with open(path, encoding="utf-8") as f:
-        css = f.read()
-    return (css.replace("MTOPH", str(TOP_H_MOBILE)).replace("MHDRH", str(HEADER_H_MOBILE))
-               .replace("TOPH", str(TOP_H)).replace("HDRH", str(HEADER_H)).replace("GUT", GUT))
-
-
-# ==================================================================== 2. STATE
-ss = st.session_state
-ss.setdefault("mic_n", 0)
-ss.setdefault("mode", "idle")          # idle | call | chat
-ss.setdefault("lang", agent.DEFAULT_LANGUAGE)
-ss.setdefault("messages", [])          # [{"role": "user"|"assistant"|"note", "content": ..., "ts": ...}]
-ss.setdefault("say", None)             # text the agent should speak next (call mode)
-ss.setdefault("hangup", False)         # True when the text in `say` is the final goodbye
-ss.setdefault("show_lang", False)      # is the language menu open?
-
-
-def stamp() -> str:
-    return time.strftime("%I:%M %p").lstrip("0")
-
-
-def add_message(role: str, content: str) -> None:
-    ss.messages.append({"role": role, "content": content, "ts": stamp()})
-
-
-def begin(mode: str) -> None:
-    """Call / Chat button clicked: start a new conversation."""
-    ss.agent = agent.SupportAgent(ss.lang)
-    greeting = ss.agent.greeting
-    ss.mode, ss.hangup, ss.messages, ss.show_lang = mode, False, [], False
-    if mode == "call":
-        ss.say = greeting            # the agent speaks first
-        if ss.lang != agent.DEFAULT_LANGUAGE:
-            ss.toast = (f"{ss.lang} is spoken with the {ss.lang} voice installed on this PC "
-                        "(Windows Settings > Time & language > Speech).")
-    else:
-        ss.say = None
-        add_message("assistant", greeting)
-
-
-def finish(note: str) -> None:
-    """End the call / chat and go back to the start screen."""
-    ss.mode, ss.say = "idle", None
-    add_message("note", note)
-
-
-def toggle_lang_menu() -> None:
-    ss.show_lang = not ss.show_lang
-
-
-def pick_lang() -> None:
-    ss.lang = ss.lang_choice
-    ss.show_lang = False
-
-
-if not agent.is_configured():
-    st.error("GEMINI_API_KEY is missing. Add it to your .env file and restart the app.")
-    st.stop()
-
-
-# ============================================================= 3. DRAW HELPERS
-# history_ph, live_ph and status are placeholders created in section 4.
-def set_status(kind: str, text: str) -> None:
-    """Status pill in the header: kind = speak | listen | think."""
-    status.markdown(f'<div class="pill {kind}"><span class="pdot"></span>{text}</div>', unsafe_allow_html=True)
-
-
-def bubble(role: str, text: str, ts: str = "", dots: bool = False) -> str:
-    """HTML for one chat bubble (role = assistant | user | note)."""
-    if role == "note":
-        return f'<div class="note"><span>{html.escape(text)}</span></div>'
-    body = ('<span class="dots"><i></i><i></i><i></i></span>' if dots
-            else html.escape(text).replace("\n", "<br>"))
-    foot = f'<div class="ts">{ts}</div>' if ts else ""
-    if role == "assistant":
-        return (f'<div class="row a"><div class="av">{HEADSET.format(s=17)}</div>'
-                f'<div class="bub">{body}{foot}</div></div>')
-    return f'<div class="row u"><div class="bub">{body}{foot}</div></div>'
-
-
-def draw_history() -> None:
-    """Draw all finished messages (or the welcome screen when there are none)."""
-    if not ss.messages and ss.mode == "idle":
-        history_ph.markdown(
-            '<div class="hero"><div class="ic">' + HEADSET.format(s=34) + '</div>'
-            '<div class="t">How can we help you today?</div>'
-            '<div class="s">Tap Call to talk or Chat to type. Change the language with the globe at the top.</div></div>',
-            unsafe_allow_html=True)
-        return
-    history_ph.markdown("".join(bubble(m["role"], m["content"], m.get("ts", "")) for m in ss.messages),
-                        unsafe_allow_html=True)
-
-
-def show_live(role: str, text: str) -> None:
-    """The bubble that is still being typed / spoken (empty text removes it)."""
-    if text:
-        live_ph.markdown(bubble(role, text), unsafe_allow_html=True)
-    else:
-        live_ph.empty()
-
-
-def show_dots() -> None:
-    live_ph.markdown(bubble("assistant", "", dots=True), unsafe_allow_html=True)
-
-
-def toast_if_saved(saved_before: int) -> None:
-    if agent.count_saved_requests() > saved_before:
-        st.toast("Your request has been recorded.", icon="✅")
-
-
-def type_reply(text: str, speak: bool, prep=None) -> None:
-    """Show the agent's reply with a typing effect (in step with the voice when speaking).
-    `prep` is a voice that was warmed up earlier, so speaking starts at once."""
-    proc = None
-    if speak:
-        if prep is not None and prep.poll() is None:
-            proc = prep
-            agent.speak_send(proc, text)
-        else:
-            if prep is not None:
-                agent.speak_cancel(prep)
-            proc = agent.speak_start(text, ss.lang)
-
-    est = max(1.0, len(text.split()) * SECONDS_PER_WORD)  # estimated speaking time
-    if proc is not None:
-        show_dots()                                  # the voice is fetching its audio: show "typing..."
-        length = agent.speak_wait_start(proc)        # returns when the audio starts playing
-        if length:
-            est = max(0.5, length)                   # real length of the audio
-    t0, shown = time.time(), 0
+@app.get("/api/tts")
+async def server_voice(text: str = Query(..., max_length=TTS_MAX_CHARS),
+                       lang: str = Query("en", max_length=8)):
+    """OPTIONAL fallback voice (Google gTTS), used only when the visitor's browser has no voice for
+    the chosen language. Needs `pip install gTTS`."""
+    if lang not in {cfg["tts"] for cfg in agent.LANGUAGES.values()}:
+        raise HTTPException(400, "unsupported language")
     try:
-        while shown < len(text) or (proc is not None and proc.poll() is None):
-            if proc is None or proc.poll() is not None:
-                target = len(text)                         # voice finished (or no voice): show the rest
-            else:
-                progress = (time.time() - t0 - VOICE_START_DELAY) / est
-                target = int(len(text) * min(1.0, max(0.0, progress)))
-            if shown < target:
-                shown = min(target, shown + GLIDE_CHARS)
-                show_live("assistant", text[:shown])
-            time.sleep(0.03)
-        if proc is not None:
-            agent.speak_finish(proc)
-    finally:
-        if proc is not None:
-            agent.speak_stop(proc)   # interrupted (End call): silence the voice
-        add_message("assistant", text)
-    live_ph.empty()
-    draw_history()
+        from gtts import gTTS
+    except ImportError:
+        raise HTTPException(501, "gTTS is not installed on the server")
 
+    def make() -> bytes:
+        buf = io.BytesIO()
+        gTTS(text=text, lang=lang).write_to_fp(buf)
+        return buf.getvalue()
 
-# ============================================================== 4. PAGE LAYOUT
-mode = ss.mode
-bar = BAR_HEIGHT[mode]
-dynamic_css = (f".st-key-bottombar {{height: {bar}px;}} "
-               f".st-key-chatbox {{height: calc(100vh - {TOP_H + bar + 12}px); height: calc(100dvh - {TOP_H + bar + 12}px);}} "
-               f"@media (max-width: 640px) {{.st-key-chatbox {{height: calc(100vh - {TOP_H_MOBILE + bar + 10}px); "
-               f"height: calc(100dvh - {TOP_H_MOBILE + bar + 10}px);}}}}")
-st.markdown(f"<style>{load_css()}{dynamic_css}</style>", unsafe_allow_html=True)
-
-# ---- header: logo + name | status pill | online badge | language icon
-badge = {"idle": '<span class="dot"></span>Online',
-         "call": '<span class="dot live"></span>On call',
-         "chat": '<span class="dot"></span>Chatting'}[mode]
-with st.container(key="topbar"):
-    with st.container(key="hdrwrap"):
-        c_name, c_status, c_badge, c_lang = st.columns([1, 0.3, 0.2, 0.1], vertical_alignment="center")
-        with c_name:
-            st.markdown(
-                '<div class="hdrl"><div class="logo">' + HEADSET.format(s=30) + '</div><div class="txt">'
-                '<div class="name">Ankesh Software Solutions</div>'
-                f'<div class="sub">CCMS Support Assistant &middot; {html.escape(agent.LANGUAGES[ss.lang]["label"])}</div>'
-                '</div></div>', unsafe_allow_html=True)
-        with c_status:
-            status = st.empty()
-        with c_badge:
-            st.markdown(f'<div class="badge">{badge}</div>', unsafe_allow_html=True)
-        with c_lang:
-            with st.container(key="langbtn"):
-                st.button("Language", icon=":material/language:", key="lang_btn", on_click=toggle_lang_menu,
-                          disabled=mode != "idle", help="Change language")
-
-# ---- language menu
-if ss.show_lang and mode == "idle":
-    with st.container(key="langpanel"):
-        options = list(agent.LANGUAGES)
-        st.radio("Language", options, index=options.index(ss.lang), key="lang_choice", on_change=pick_lang,
-                 format_func=lambda k: agent.LANGUAGES[k]["label"])
-
-# ---- auto-scroll script
-try:
-    if hasattr(st, "iframe"):                 # newer Streamlit
-        st.iframe(SCROLL_JS, height=1)
-    else:                                     # older Streamlit
-        import streamlit.components.v1 as components
-        components.html(SCROLL_JS, height=0)
-except Exception:
-    pass  # scrolling by hand still works
-
-# ---- chat panel
-with st.container(key="chatbox"):
-    with st.container():  # single child
-        history_ph = st.empty()   # finished messages
-        live_ph = st.empty()      # the message being typed / spoken / heard right now
-
-# ---- bottom bar: Call + Chat buttons, or End call, or the text box + End chat
-typed = None
-with st.container(key="bottombar"):
-    if mode == "idle":
-        with st.container(key="idlebar"):
-            c_call, c_chat = st.columns(2)
-            with c_call:
-                st.button("Call", icon=":material/call:", key="call_btn",
-                          on_click=begin, args=("call",), help="Call the assistant")
-            with c_chat:
-                st.button("Chat", icon=":material/chat:", key="chat_btn",
-                          on_click=begin, args=("chat",), help="Chat with the assistant")
-    elif mode == "call":
-        with st.container(key="callbar"):
-            st.button("End call", icon=":material/call_end:", key="end_call_btn",
-                      on_click=finish, args=("Call ended",), help="End call")
-    else:
-        c_text, c_end = st.columns([8, 1], vertical_alignment="center")
-        with c_text:
-            typed = st.chat_input("Type your message...")
-        with c_end:
-            st.button("End chat", icon=":material/close:", key="end_chat_btn",
-                      on_click=finish, args=("Chat ended",), help="End chat")
-
-if ss.get("toast"):
-    st.toast(ss.pop("toast"), icon="🔊")
-
-draw_history()
-
-
-# ============================================================== 5. CHAT MODE
-def handle_typed_message(text: str) -> None:
-    add_message("user", text)
-    draw_history()
-    show_dots()
     try:
-        saved_before = agent.count_saved_requests()
-        reply, ended = ss.agent.hear(text)
-    except Exception as e:
-        live_ph.empty()
-        add_message("note", f"Something went wrong, please try again. ({e})")
-        draw_history()
-        return
-    live_ph.empty()
-    type_reply(reply, speak=False)
-    toast_if_saved(saved_before)
-    if ended:
-        finish("Chat ended")
-        st.rerun()
+        audio = await asyncio.to_thread(make)
+    except Exception:
+        log.exception("gTTS failed")
+        raise HTTPException(502, "voice service unavailable")
+    return Response(audio, media_type="audio/mpeg")
 
 
-if mode == "chat" and typed:
-    handle_typed_message(typed)
+# ===================================================== 3. CONVERSATION SOCKET
+async def run_turn(ws: WebSocket, session: "agent.SupportAgent", events) -> None:
+    """Run one turn and forward its events to the browser as they happen.
 
+    `events` is a normal (blocking) generator from agent.py. It runs in a worker thread so the
+    server stays free for other callers, and every sentence is sent the moment Gemini finishes it."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
 
-# ============================================================== 6. CALL MODE
-def listen_and_reply():
-    """Listen to the caller and work out the agent's next words. Returns (reply, ended)."""
-    set_status("listen", "Listening... please speak")
-    heard, spoke = agent.listen_live(
-        on_partial=lambda t: show_live("user", t), language=ss.lang,
-        tick=lambda: set_status("listen", "Listening... please speak"))
-    live_ph.empty()
+    def pump() -> None:                          # runs in the worker thread
+        try:
+            for event in events:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception:
+            log.exception("Turn failed")
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", "Something went wrong, please try again."))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
-    if heard:                                  # the caller said something
-        add_message("user", heard)
-        draw_history()
-        set_status("think", "Thinking...")
-        show_dots()
-        saved_before = agent.count_saved_requests()
-        reply, ended = ss.agent.hear(heard)
-        live_ph.empty()
-        toast_if_saved(saved_before)
-        return reply, ended
-    if spoke:                                  # speech was heard but not understood
-        return ss.agent.hear("")
-    return ss.agent.silence()                  # silence: "Are you still there?", then end the call
-
-
-def run_call() -> None:
-    """Loop: agent speaks -> caller speaks -> agent replies ... until the call ends."""
-    prep = agent.speak_prepare(ss.lang)          # warm up the voice for the greeting
-    try:
-        while ss.mode == "call":
-            if ss.say:                           # 1) the agent speaks
-                set_status("speak", "Agent is speaking...")
-                text, ss.say = ss.say, None
-                type_reply(text, speak=True, prep=prep)
-                prep = None
-                if ss.hangup:                    # the final goodbye has been spoken
-                    finish("Call ended")
-                    break
-
-            prep = agent.speak_prepare(ss.lang)  # 2) warms up while we listen and think
-            ss.say, ss.hangup = listen_and_reply()
-    except Exception as e:  # mic / speaker / AI errors end the call cleanly
-        finish(f"Call stopped: {e}")
-    finally:
-        if prep is not None:
-            agent.speak_cancel(prep)
-    status.empty()
-    live_ph.empty()
-    if ss.mode != "call":
-        st.rerun()
-
-def run_browser_call() -> None:
-    """Call mode for servers: the browser records and plays the audio."""
-    if ss.say:                                    # the agent's turn: show text + play voice
-        text, ss.say = ss.say, None
-        add_message("assistant", text)
-        draw_history()
-        st.audio(agent.tts_bytes(text, ss.lang), format="audio/mp3", autoplay=True)
-        if ss.hangup:
-            finish("Call ended")
-            st.rerun()
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
+        event = await queue.get()
+        if event is None:
             return
+        kind, value = event
+        if kind == "sentence":
+            await ws.send_json({"type": "sentence", "text": value,
+                                "say": agent.speech_text(value, session.language)})
+        elif kind == "end":
+            await ws.send_json({"type": "end", **value})
+        else:
+            await ws.send_json({"type": "error", "message": value})
 
-    rec = st.audio_input("Tap the mic, speak, then tap stop to send",
-                         key=f"mic_{ss.mic_n}")
-    if rec is not None:                           # the caller's turn
-        ss.mic_n += 1                             # resets the recorder for the next turn
-        with st.spinner("Thinking..."):
-            heard = agent.transcribe_audio(rec.getvalue(), ss.lang)
-            if heard:
-                add_message("user", heard)
-            saved_before = agent.count_saved_requests()
-            ss.say, ss.hangup = ss.agent.hear(heard)
-        toast_if_saved(saved_before)
-        st.rerun()
-        
-if mode == "call":
-    if agent.LOCAL_AUDIO:
-        run_call()            # your PC: real microphone and speaker
-    else:
-        run_browser_call()
+
+@app.websocket("/ws")
+async def conversation(ws: WebSocket):
+    """One WebSocket = one conversation (one SupportAgent)."""
+    await ws.accept()
+    session = None
+    turns = 0
+    try:
+        while True:
+            msg = await ws.receive_json()
+            kind = msg.get("type") if isinstance(msg, dict) else None
+
+            if kind == "start":                  # a new call or chat
+                try:
+                    session = await asyncio.to_thread(agent.SupportAgent, str(msg.get("lang", "")))
+                except Exception as e:           # bad key, missing knowledge base ...
+                    log.exception("Could not start the agent")
+                    await ws.send_json({"type": "error", "message": f"Could not start: {e}"})
+                    continue
+                turns = 0
+                await run_turn(ws, session, agent.fixed_events(session.greeting, False))
+
+            elif kind == "end":                  # caller hung up
+                break
+
+            elif kind in ("text", "unheard", "silence"):
+                if session is None:
+                    await ws.send_json({"type": "error", "message": "Conversation not started."})
+                    continue
+                turns += 1
+                if turns > MAX_TURNS:
+                    await ws.send_json({"type": "error", "message": "Conversation limit reached."})
+                    break
+                if kind == "text":
+                    text = str(msg.get("text", "")).strip()[:MAX_TEXT_CHARS]
+                    events = session.hear_stream(text)      # "" counts as "not understood"
+                elif kind == "unheard":
+                    events = session.hear_stream("")
+                else:
+                    events = session.silence_stream()
+                await run_turn(ws, session, events)
+            # anything else is ignored
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("Socket error")
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":                       # python app.py  (same as the uvicorn command)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
