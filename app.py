@@ -26,6 +26,7 @@ import threading
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 import agent
 
@@ -60,6 +61,7 @@ QUICK_QUESTIONS = {
 }
 
 app = FastAPI(title="CCMS Support Agent")
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
 # ======================================================== 2. PAGES AND SMALL APIS
